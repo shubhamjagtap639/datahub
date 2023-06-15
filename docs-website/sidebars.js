@@ -91,6 +91,11 @@ module.exports = {
               id: "docs/lineage/airflow",
               label: "Airflow",
             },
+            {
+              type: "doc",
+              id: "docs/lineage/prefect",
+              label: "Prefect",
+            },
 
             //"docker/airflow/local_airflow",
             "metadata-integration/java/spark-lineage/README",
