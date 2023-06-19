@@ -19,20 +19,12 @@ Blocks are primitive within Prefect that enable the storage of configuration and
 ```shell
 prefect profile inspect
 ```
-5. If you are using Prefect Cloud, the api url should be set as `https://api.prefect.cloud/api/accounts/<account_id>/workspaces/<workspace_id>`.
-6. If you are using a self hosted Prefect server, the api url should be set as `http://127.0.0.1:4200/api`.
+5. If you are using Prefect Cloud, the API URL should be set as `https://api.prefect.cloud/api/accounts/<account_id>/workspaces/<workspace_id>`.
+6. If you are using a self-hosted Prefect server, the API URL should be set as `http://<host>:<port>/api`.
 
 ## Setup
 
-1. You need to install the required dependency to use prefect datahub block in prefect workflow code.
-
-```shell
-pip install prefect-datahub
-```
-
-2. You need to save the datahub configuration to a block. See <https://prefecthq.github.io/prefect-datahub/#saving-configurations-to-a-block>.
-
-3. Load the saved block and use it in prefect workflow to emit the metadata event. See <https://prefecthq.github.io/prefect-datahub/#load-the-saved-block-in-prefect-workflows>.
+For setup detail please refer [prefct-datahub](https://prefecthq.github.io/prefect-datahub/).
 
 ## How to validate saved block and emit of metadata
 
@@ -54,4 +46,4 @@ prefect config set PREFECT_API_URL='http://127.0.0.1:4200/api'
 ```
 
 ### Connection error for Datahub Rest URL
-If you get ConnectionError: HTTPConnectionPool(host='localhost', port=8080), then in that case you need to restart the Datahub GMS service.
+If you get ConnectionError: HTTPConnectionPool(host='localhost', port=8080), then in that case your GMS service is not up.
