@@ -1,2 +1,0 @@
-[prefect.collections]
-prefect_datahub = prefect_datahub
