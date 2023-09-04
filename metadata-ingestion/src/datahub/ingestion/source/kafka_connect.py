@@ -229,7 +229,7 @@ def make_lineage_dataset_field_urn(
     config: KafkaConnectSourceConfig,
     platform: str,
     dataset: str,
-    dataset_field: List[str],
+    dataset_field: str,
     platform_instance: Optional[str],
 ) -> str:
     if config.convert_lineage_urns_to_lowercase:
@@ -1011,6 +1011,11 @@ class SnowflakeSinkConnector:
 
     def _extract_cll(self):
         for lineage in self.connector_manifest.lineages:
+            # If sink type is file or
+            # Source dataset is none
+            if self.ctx.graph is None or lineage.source_dataset is None:
+                continue
+
             source_dataset_run = make_lineage_dataset_urn(
                 self.config,
                 lineage.source_platform,
@@ -1019,16 +1024,13 @@ class SnowflakeSinkConnector:
                     self.config, self.connector_manifest.name, lineage.source_platform
                 ),
             )
-            if self.ctx.graph is None:  # If sink type is file
-                continue
 
             source_schema_aspect = self.ctx.graph.get_aspect(
                 source_dataset_run,
                 SchemaMetadataClass,
             )
-            if (
-                source_schema_aspect is None
-            ):  # If source dataset metadata is not yet ingested
+            if source_schema_aspect is None:
+                # If source dataset metadata is not yet ingested
                 continue
 
             is_snowpipe_streaming: bool = False
@@ -1409,7 +1411,7 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
                         )
                         for source_dataset_field in source_dataset_fields
                     ]
-                    if source_dataset_fields
+                    if source_dataset_fields and source_dataset
                     else []
                 )
                 outlets_fields = (
@@ -1439,7 +1441,9 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
                                     source_platform_instance,
                                 )
                                 for source_column in column_lineage.source_columns
-                            ],
+                            ]
+                            if source_dataset
+                            else [],
                             downstreamType=FineGrainedLineageDownstreamType.FIELD_SET,
                             downstreams=[
                                 make_lineage_dataset_field_urn(
