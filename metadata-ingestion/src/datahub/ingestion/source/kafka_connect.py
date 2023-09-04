@@ -38,6 +38,12 @@ from datahub.ingestion.source.state.stateful_ingestion_base import (
     StatefulIngestionConfigBase,
     StatefulIngestionSourceBase,
 )
+from datahub.metadata.com.linkedin.pegasus2avro.dataset import (
+    FineGrainedLineage,
+    FineGrainedLineageDownstreamType,
+    FineGrainedLineageUpstreamType,
+)
+from datahub.metadata.schema_classes import SchemaMetadataClass
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +104,11 @@ class KafkaConnectSourceConfig(
         default=[],
         description="Provide lineage graph for sources connectors other than Confluent JDBC Source Connector, Debezium Source Connector, and Mongo Source Connector",
     )
-
     stateful_ingestion: Optional[StatefulStaleMetadataRemovalConfig] = None
+    include_column_lineage: bool = Field(
+        default=False,
+        description="Populates topic->table and table->topic column lineage.",
+    )
 
 
 @dataclass
@@ -115,6 +124,12 @@ class KafkaConnectSourceReport(StaleEntityRemovalSourceReport):
 
 
 @dataclass
+class ColumnLineageMap:
+    source_columns: List[str]
+    target_columns: List[str]
+
+
+@dataclass
 class KafkaConnectLineage:
     """Class to store Kafka Connect lineage mapping, Each instance is potential DataJob"""
 
@@ -123,6 +138,9 @@ class KafkaConnectLineage:
     target_platform: str
     job_property_bag: Optional[Dict[str, str]] = None
     source_dataset: Optional[str] = None
+    source_dataset_fields: Optional[List[str]] = None
+    target_dataset_fields: Optional[List[str]] = None
+    column_lineages: Optional[List[ColumnLineageMap]] = None
 
 
 @dataclass
@@ -191,6 +209,38 @@ def get_platform_instance(
         f"Instance name assigned is: {instance_name} for Connector Name {connector_name} and platform {platform}"
     )
     return instance_name
+
+
+def make_lineage_dataset_urn(
+    config: KafkaConnectSourceConfig,
+    platform: str,
+    dataset: str,
+    platform_instance: Optional[str],
+) -> str:
+    if config.convert_lineage_urns_to_lowercase:
+        dataset = dataset.lower()
+
+    return builder.make_dataset_urn_with_platform_instance(
+        platform, dataset, platform_instance, config.env
+    )
+
+
+def make_lineage_dataset_field_urn(
+    config: KafkaConnectSourceConfig,
+    platform: str,
+    dataset: str,
+    dataset_field: List[str],
+    platform_instance: Optional[str],
+) -> str:
+    if config.convert_lineage_urns_to_lowercase:
+        dataset = dataset.lower()
+
+    return builder.make_schema_field_urn(
+        builder.make_dataset_urn_with_platform_instance(
+            platform, dataset, platform_instance, config.env
+        ),
+        dataset_field,
+    )
 
 
 @dataclass
@@ -885,11 +935,19 @@ class SnowflakeSinkConnector:
     report: KafkaConnectSourceReport
 
     def __init__(
-        self, connector_manifest: ConnectorManifest, report: KafkaConnectSourceReport
+        self,
+        connector_manifest: ConnectorManifest,
+        config: KafkaConnectSourceConfig,
+        ctx: PipelineContext,
+        report: KafkaConnectSourceReport,
     ) -> None:
         self.connector_manifest = connector_manifest
+        self.config = config
+        self.ctx = ctx
         self.report = report
         self._extract_lineages()
+        if self.config.include_column_lineage:
+            self._extract_cll()
 
     @dataclass
     class SnowflakeParser:
@@ -950,6 +1008,70 @@ class SnowflakeSinkConnector:
 
         self.connector_manifest.lineages = lineages
         return
+
+    def _extract_cll(self):
+        for lineage in self.connector_manifest.lineages:
+            source_dataset_run = make_lineage_dataset_urn(
+                self.config,
+                lineage.source_platform,
+                lineage.source_dataset,
+                get_platform_instance(
+                    self.config, self.connector_manifest.name, lineage.source_platform
+                ),
+            )
+            if self.ctx.graph is None:  # If sink type is file
+                continue
+
+            source_schema_aspect = self.ctx.graph.get_aspect(
+                source_dataset_run,
+                SchemaMetadataClass,
+            )
+            if (
+                source_schema_aspect is None
+            ):  # If source dataset metadata is not yet ingested
+                continue
+
+            is_snowpipe_streaming: bool = False
+            if "snowflake.ingestion.method" in self.connector_manifest.config:
+                is_snowpipe_streaming = self.connector_manifest.config[
+                    "snowflake.ingestion.method"
+                ]
+
+            # key schema dosn't get mapped with any target dataset column
+            source_dataset_fields: List[str] = [
+                schema_field.fieldPath.split(".")[-1]
+                for schema_field in source_schema_aspect.fields
+                if not schema_field.isPartOfKey
+            ]
+            target_dataset_fields: List[str] = []
+            column_lineages: List[ColumnLineageMap] = []
+
+            if not is_snowpipe_streaming:
+                # If ingestion method is snowpipe streaming, there is 1:1 column mapping
+                for source_field in source_dataset_fields:
+                    target_field = source_field.lower()
+                    target_dataset_fields.append(target_field)
+                    column_lineages.append(
+                        ColumnLineageMap(
+                            source_columns=[source_field], target_columns=[target_field]
+                        )
+                    )
+            else:
+                # else by default every snowflake table loaded by kafka connector has two column:
+                # RECORD_METADATA: This contains metadata about the message.
+                # RECORD_CONTENT: This contains the Kafka message.
+                default_field = ["record_content", "record_metadata"]
+                target_dataset_fields.extend(default_field)
+                column_lineages.append(
+                    ColumnLineageMap(
+                        source_columns=source_dataset_fields,
+                        target_columns=[default_field[0]],
+                    )
+                )
+
+            lineage.source_dataset_fields = source_dataset_fields
+            lineage.target_dataset_fields = target_dataset_fields
+            lineage.column_lineages = column_lineages
 
 
 @dataclass
@@ -1051,6 +1173,7 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
     def __init__(self, config: KafkaConnectSourceConfig, ctx: PipelineContext):
         super().__init__(config, ctx)
         self.config = config
+        self.ctx = ctx
         self.report = KafkaConnectSourceReport()
         self.session = requests.Session()
         self.session.headers.update(
@@ -1183,7 +1306,10 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
                     "com.snowflake.kafka.connector.SnowflakeSinkConnector"
                 ):
                     connector_manifest = SnowflakeSinkConnector(
-                        connector_manifest=connector_manifest, report=self.report
+                        connector_manifest=connector_manifest,
+                        config=self.config,
+                        ctx=self.ctx,
+                        report=self.report,
                     ).connector_manifest
                 else:
                     self.report.report_dropped(connector_manifest.name)
@@ -1234,10 +1360,13 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
         if lineages:
             for lineage in lineages:
                 source_dataset = lineage.source_dataset
+                source_dataset_fields = lineage.source_dataset_fields
                 source_platform = lineage.source_platform
                 target_dataset = lineage.target_dataset
+                target_dataset_fields = lineage.target_dataset_fields
                 target_platform = lineage.target_platform
                 job_property_bag = lineage.job_property_bag
+                column_lineages = lineage.column_lineages
 
                 source_platform_instance = get_platform_instance(
                     self.config, connector_name, source_platform
@@ -1251,18 +1380,83 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
 
                 inlets = (
                     [
-                        self.make_lineage_dataset_urn(
-                            source_platform, source_dataset, source_platform_instance
+                        make_lineage_dataset_urn(
+                            self.config,
+                            source_platform,
+                            source_dataset,
+                            source_platform_instance,
                         )
                     ]
                     if source_dataset
                     else []
                 )
                 outlets = [
-                    self.make_lineage_dataset_urn(
-                        target_platform, target_dataset, target_platform_instance
+                    make_lineage_dataset_urn(
+                        self.config,
+                        target_platform,
+                        target_dataset,
+                        target_platform_instance,
                     )
                 ]
+                inlets_fields = (
+                    [
+                        make_lineage_dataset_field_urn(
+                            self.config,
+                            source_platform,
+                            source_dataset,
+                            source_dataset_field,
+                            source_platform_instance,
+                        )
+                        for source_dataset_field in source_dataset_fields
+                    ]
+                    if source_dataset_fields
+                    else []
+                )
+                outlets_fields = (
+                    [
+                        make_lineage_dataset_field_urn(
+                            self.config,
+                            target_platform,
+                            target_dataset,
+                            target_dataset_field,
+                            target_platform_instance,
+                        )
+                        for target_dataset_field in target_dataset_fields
+                    ]
+                    if target_dataset_fields
+                    else []
+                )
+                fine_grained_lineages = (
+                    [
+                        FineGrainedLineage(
+                            upstreamType=FineGrainedLineageUpstreamType.FIELD_SET,
+                            upstreams=[
+                                make_lineage_dataset_field_urn(
+                                    self.config,
+                                    source_platform,
+                                    source_dataset,
+                                    source_column,
+                                    source_platform_instance,
+                                )
+                                for source_column in column_lineage.source_columns
+                            ],
+                            downstreamType=FineGrainedLineageDownstreamType.FIELD_SET,
+                            downstreams=[
+                                make_lineage_dataset_field_urn(
+                                    self.config,
+                                    target_platform,
+                                    target_dataset,
+                                    target_column,
+                                    target_platform_instance,
+                                )
+                                for target_column in column_lineage.target_columns
+                            ],
+                        )
+                        for column_lineage in column_lineages
+                    ]
+                    if column_lineages
+                    else []
+                )
 
                 yield MetadataChangeProposalWrapper(
                     entityUrn=job_urn,
@@ -1278,6 +1472,9 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
                     aspect=models.DataJobInputOutputClass(
                         inputDatasets=inlets,
                         outputDatasets=outlets,
+                        inputDatasetFields=inlets_fields,
+                        outputDatasetFields=outlets_fields,
+                        fineGrainedLineages=fine_grained_lineages,
                     ),
                 ).as_workunit()
 
@@ -1331,16 +1528,6 @@ class KafkaConnectSource(StatefulIngestionSourceBase):
 
     def get_report(self) -> KafkaConnectSourceReport:
         return self.report
-
-    def make_lineage_dataset_urn(
-        self, platform: str, name: str, platform_instance: Optional[str]
-    ) -> str:
-        if self.config.convert_lineage_urns_to_lowercase:
-            name = name.lower()
-
-        return builder.make_dataset_urn_with_platform_instance(
-            platform, name, platform_instance, self.config.env
-        )
 
 
 # TODO: Find a more automated way to discover new platforms with 3 level naming hierarchy.
